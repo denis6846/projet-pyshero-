@@ -1,0 +1,671 @@
+import time
+import math
+import tkinter as tk
+
+import nest_asyncio
+from spherov2 import scanner
+from spherov2.sphero_edu import SpheroEduAPI, EventType
+from spherov2.types import Color
+
+nest_asyncio.apply()
+
+
+TARGET_MAC = "EE:DC:47:0B:DB:73"
+
+VITESSE          = 30
+ROLL_VITESSE     = 25
+ROLL_DUREE       = 1.2
+PERIODE_MS       = 200
+PERIODE_ROLL_MS  = 250
+
+COLLISION_COOLDOWN = 0.55
+ECART_CAP          = 40
+N_GLISSEMENT       = 5
+VITESSE_SEUIL      = 2
+DELAI_BLOCAGE      = 2.0
+N_BLOCAGE          = 2
+
+MAX_SAUT       = 90
+PAS_MIN_TRACE  = 2.5
+DIST_MIN_OCC   = 9
+PROJ_MUR       = 13
+
+CELL_CM               = 8
+PATH_STEP_CM          = 5
+R_CLUSTER             = 34
+MIN_CLUSTER           = 3
+D_INTERIEUR_OBSTACLE  = 30
+
+W, H           = 1100, 700
+MARGE_VUE      = 80
+START_VIEW_CM  = 70
+SCALE_MAX      = 8.0
+SCALE_MIN      = 0.45
+REFIT_DELTA    = 0.06
+GRID           = 40
+RINGS          = [70, 140, 210, 280]
+
+BG     = "#020a02"
+SCAN   = "#061206"
+C_GRID = "#0a3a0a"
+DIM    = "#1f7a1f"
+MID    = "#33cc33"
+BRIGHT = "#7dff5a"
+BLIP   = "#b6ff2e"
+HOT    = "#eaffd0"
+OBST   = "#ff7a18"
+FREE   = "#0f4f0f"
+
+MONO   = ("Courier", 11, "bold")
+SMALL  = ("Courier", 9, "bold")
+TITLEF = ("Courier", 15, "bold")
+BIGF   = ("Courier", 22, "bold")
+
+
+R = Color(255, 0, 0)
+V = Color(0, 255, 0)
+_ = None
+NOIR = Color(0, 0, 0)
+
+MATRICE_67 = [
+    [R, R, R, R, _, _, _, V],
+    [R, _, _, R, _, _, _, V],
+    [R, _, _, R, _, _, _, V],
+    [R, R, R, R, _, _, _, V],
+    [R, _, _, _, _, V, V, V],
+    [R, _, _, _, _, _, _, V],
+    [R, _, _, _, _, _, _, V],
+    [R, R, R, R, V, V, V, V],
+]
+
+
+def afficher_67():
+    try:
+        droid.set_matrix_fill(0, 0, 7, 7, NOIR)
+    except Exception:
+        pass
+    try:
+        for y in range(8):
+            for x in range(8):
+                couleur = MATRICE_67[y][x]
+                if couleur is not None:
+                    droid.set_matrix_pixel(x, y, couleur)
+                    time.sleep(0.012)
+    except Exception as e:
+        print(f"Affichage matrice 67 impossible (robot non-BOLT ?) : {e}")
+
+
+print("Recherche du robot...")
+toys = scanner.find_toys()
+try:
+    toy = next(t for t in toys if t.address.lower() == TARGET_MAC.lower())
+except StopIteration:
+    print(f"Erreur : le robot {TARGET_MAC} est introuvable.")
+    raise SystemExit
+
+droid = SpheroEduAPI(toy)
+droid.__enter__()
+print("Connecte.")
+afficher_67()
+
+
+points = []
+free_cells = set()
+
+derniere_trace = [None]
+derniere_occ = [None]
+
+nav = {"actif": False, "cap": 0.0, "sweep": 0}
+
+det = {
+    "hit": False,
+    "glissements": 0,
+    "blocages": 0,
+    "t_demarrage": 0.0,
+    "t_capteur": 0.0,
+}
+
+view = {"scale": SCALE_MAX, "ox": W / 2, "oy": H / 2, "rot": 0.0}
+bbox = {"minx": None, "maxx": None, "miny": None, "maxy": None, "span": 0.0}
+
+
+def _on_collision(api):
+    if time.time() - det["t_capteur"] >= COLLISION_COOLDOWN:
+        det["hit"] = True
+        det["t_capteur"] = time.time()
+
+
+droid.register_event(EventType.on_collision, _on_collision)
+
+
+def detect_collision():
+    if det["hit"]:
+        return True
+
+    v = droid.get_velocity()
+    vitesse = math.hypot(v["x"], v["y"])
+    cap = droid.get_heading()
+
+    if vitesse > VITESSE_SEUIL:
+        direction = math.degrees(math.atan2(v["x"], v["y"])) % 360
+        ecart = abs((direction - cap + 180) % 360 - 180)
+        det["glissements"] = det["glissements"] + 1 if ecart > ECART_CAP else 0
+        if det["glissements"] >= N_GLISSEMENT:
+            det.update(hit=True, glissements=0)
+    else:
+        det["glissements"] = 0
+
+    if vitesse < VITESSE_SEUIL and (time.time() - det["t_demarrage"]) > DELAI_BLOCAGE:
+        det["blocages"] += 1
+        if det["blocages"] >= N_BLOCAGE:
+            det.update(hit=True, blocages=0)
+    else:
+        det["blocages"] = 0
+
+    return det["hit"]
+
+
+def reset_collision_state():
+    det.update(hit=False, glissements=0, blocages=0, t_demarrage=time.time())
+
+
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+
+def cell_of(x, y):
+    return int(round(x / CELL_CM)), int(round(y / CELL_CM))
+
+
+def cell_center(c):
+    return c[0] * CELL_CM, c[1] * CELL_CM
+
+
+def mark_free(x, y):
+    c = cell_of(x, y)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            free_cells.add((c[0] + dx, c[1] + dy))
+
+
+def sample_segment(a, b, step=PATH_STEP_CM):
+    ax, ay = a
+    bx, by = b
+    d = math.hypot(bx - ax, by - ay)
+    if d <= 0:
+        return [(bx, by)]
+    n = max(1, int(math.ceil(d / step)))
+    return [(ax + (bx - ax) * i / n, ay + (by - ay) * i / n) for i in range(n + 1)]
+
+
+def enveloppe_convexe(pts):
+    pts = sorted(set((round(x, 3), round(y, 3)) for x, y in pts))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    bas = []
+    for p in pts:
+        while len(bas) >= 2 and cross(bas[-2], bas[-1], p) <= 0:
+            bas.pop()
+        bas.append(p)
+    haut = []
+    for p in reversed(pts):
+        while len(haut) >= 2 and cross(haut[-2], haut[-1], p) <= 0:
+            haut.pop()
+        haut.append(p)
+    return bas[:-1] + haut[:-1]
+
+
+def aire_m2(poly):
+    n = len(poly)
+    if n < 3:
+        return 0.0
+    s = sum(poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1] for i in range(n))
+    return abs(s) / 2.0 / 10000.0
+
+
+def dist_point_segment(p, a, b):
+    if a == b:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t = clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy), 0, 1)
+    return math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+
+
+def dist_au_contour(p, poly):
+    if len(poly) < 2:
+        return 0.0
+    return min(dist_point_segment(p, poly[i], poly[(i + 1) % len(poly)]) for i in range(len(poly)))
+
+
+def regrouper(pts, r):
+    pts = list(pts)
+    used = [False] * len(pts)
+    out = []
+    for i in range(len(pts)):
+        if used[i]:
+            continue
+        pile = [i]
+        used[i] = True
+        comp = [pts[i]]
+        while pile:
+            j = pile.pop()
+            for k in range(len(pts)):
+                if not used[k] and math.hypot(pts[j][0] - pts[k][0], pts[j][1] - pts[k][1]) <= r:
+                    used[k] = True
+                    pile.append(k)
+                    comp.append(pts[k])
+        out.append(comp)
+    return out
+
+
+def moyenne_pts(pts):
+    if not pts:
+        return 0.0, 0.0
+    return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+
+
+def to_screen(x, y):
+    r = view["rot"]
+    c, s = math.cos(r), math.sin(r)
+    xr, yr = x * c - y * s, x * s + y * c
+    return xr * view["scale"] + view["ox"], view["oy"] - yr * view["scale"]
+
+
+def draw_point(x, y, col):
+    sx, sy = to_screen(x, y)
+    if col:
+        canvas.create_oval(sx - 5, sy - 5, sx + 5, sy + 5, outline=BLIP, tags="pt")
+        canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2, fill=HOT, outline="", tags="pt")
+    else:
+        canvas.create_oval(sx - 1, sy - 1, sx + 1, sy + 1, fill=DIM, outline="", tags="pt")
+
+
+def maj_bbox(x, y):
+    if bbox["minx"] is None:
+        bbox.update(minx=x, maxx=x, miny=y, maxy=y, span=START_VIEW_CM)
+        return True
+    old_span = bbox["span"]
+    changed = False
+    if x < bbox["minx"]:
+        bbox["minx"] = x; changed = True
+    if x > bbox["maxx"]:
+        bbox["maxx"] = x; changed = True
+    if y < bbox["miny"]:
+        bbox["miny"] = y; changed = True
+    if y > bbox["maxy"]:
+        bbox["maxy"] = y; changed = True
+    if not changed:
+        return False
+    span = max(bbox["maxx"] - bbox["minx"], bbox["maxy"] - bbox["miny"], START_VIEW_CM)
+    if span > old_span * (1 + REFIT_DELTA):
+        bbox["span"] = span
+        return True
+    return False
+
+
+def fit_to_bbox():
+    if bbox["minx"] is None:
+        view.update(scale=SCALE_MAX, ox=W / 2, oy=H / 2, rot=0.0)
+        return
+    cx = (bbox["minx"] + bbox["maxx"]) / 2
+    cy = (bbox["miny"] + bbox["maxy"]) / 2
+    dx = max(bbox["maxx"] - bbox["minx"], START_VIEW_CM)
+    dy = max(bbox["maxy"] - bbox["miny"], START_VIEW_CM)
+    s = clamp(min((W - 2 * MARGE_VUE) / dx, (H - 2 * MARGE_VUE) / dy), SCALE_MIN, SCALE_MAX)
+    view["scale"] = s
+    view["ox"] = W / 2 - s * cx
+    view["oy"] = H / 2 + s * cy
+
+
+def corner_brackets():
+    L, m = 26, 14
+    for (cx, cy, sx, sy) in [(m, m, 1, 1), (W - m, m, -1, 1), (m, H - m, 1, -1), (W - m, H - m, -1, -1)]:
+        canvas.create_line(cx, cy, cx + sx * L, cy, fill=BRIGHT, width=2)
+        canvas.create_line(cx, cy, cx, cy + sy * L, fill=BRIGHT, width=2)
+
+
+def hud_labels(titre):
+    canvas.create_text(20, 16, text="WEYLAND-YUTANI CORP", fill=DIM, font=SMALL, anchor="w")
+    canvas.create_text(W / 2, 16, text=titre, fill=BRIGHT, font=TITLEF, anchor="center")
+    etat = "SCAN" if nav["actif"] else "IDLE"
+    canvas.create_text(W - 20, 16, text=f"{etat} // ENSISA", fill=DIM, font=SMALL, anchor="e")
+    canvas.create_text(W - 20, H - 14, text="MU/TH/UR 6000", fill=DIM, font=SMALL, anchor="e")
+
+
+def panneau_aide():
+    lignes = ["PROCEDURE :",
+              " 1 > SCAN   (exploration auto)",
+              " 2 > MAP    (plan + obstacles)",
+              " o > PURGE  (effacer la carte)"]
+    x0, y0 = 40, H / 2 - 50
+    canvas.create_rectangle(x0 - 14, y0 - 18, x0 + 300, y0 + 78, outline=DIM, fill="#031603")
+    for i, t in enumerate(lignes):
+        canvas.create_text(x0, y0 + i * 24, text=t, fill=BRIGHT if i == 0 else MID,
+                           font=MONO, anchor="w")
+
+
+def decor(tracker=True, aide=False):
+    canvas.delete("all")
+    for yy in range(0, H, 5):
+        canvas.create_line(0, yy, W, yy, fill=SCAN)
+    for xx in range(0, W, GRID):
+        canvas.create_line(xx, 0, xx, H, fill=C_GRID)
+    for yy in range(0, H, GRID):
+        canvas.create_line(0, yy, W, yy, fill=C_GRID)
+    if tracker:
+        cx, cy = W / 2, H / 2
+        for r in RINGS:
+            canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=DIM)
+        canvas.create_line(cx - 14, cy, cx + 14, cy, fill=MID)
+        canvas.create_line(cx, cy - 14, cx, cy + 14, fill=MID)
+        canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, outline=BRIGHT, width=2)
+    corner_brackets()
+    hud_labels("MOTION TRACKER" if tracker else "PLAN / SCHEMATIC")
+    if aide:
+        panneau_aide()
+
+
+def draw_sweep(angle):
+    canvas.delete("sweep")
+    if not nav["actif"]:
+        return
+    cx, cy = W / 2, H / 2
+    rmax = max(RINGS)
+    a = math.radians(angle)
+    canvas.create_line(cx, cy, cx + rmax * math.cos(a), cy - rmax * math.sin(a),
+                       fill=BRIGHT, width=2, tags="sweep")
+
+
+def redraw_all(tracker=True):
+    decor(tracker)
+    for x, y, col in points:
+        draw_point(x, y, col)
+
+
+def draw_free_cells():
+    for c in free_cells:
+        x, y = cell_center(c)
+        sx, sy = to_screen(x, y)
+        canvas.create_rectangle(sx - 1, sy - 1, sx + 1, sy + 1, fill=FREE, outline="")
+
+
+def position():
+    p = droid.get_location()
+    return p["x"], p["y"]
+
+
+def projeter(x, y, cap, distance=PROJ_MUR):
+    a = math.radians(cap)
+    return x + distance * math.sin(a), y + distance * math.cos(a)
+
+
+def placer_point(x, y, col):
+    if maj_bbox(x, y):
+        fit_to_bbox()
+        redraw_all(tracker=True)
+    else:
+        draw_point(x, y, col)
+
+
+def add_trace(x, y):
+    last = derniere_trace[0]
+    if last is not None:
+        d = math.hypot(x - last[0], y - last[1])
+        if d > MAX_SAUT:
+            derniere_trace[0] = (x, y)
+            return
+        for px, py in sample_segment(last, (x, y)):
+            mark_free(px, py)
+        if d < PAS_MIN_TRACE:
+            return
+    else:
+        mark_free(x, y)
+    derniere_trace[0] = (x, y)
+    points.append((x, y, False))
+    placer_point(x, y, False)
+
+
+def add_occ(x, y):
+    last = derniere_occ[0]
+    if last is not None and math.hypot(x - last[0], y - last[1]) < DIST_MIN_OCC:
+        return
+    derniere_occ[0] = (x, y)
+    points.append((x, y, True))
+    placer_point(x, y, True)
+
+
+def enregistrer_mur(x, y):
+    px, py = projeter(x, y, nav["cap"])
+    add_occ(px, py)
+
+
+def ligne(cap):
+    nav["cap"] = cap % 360
+    droid.set_heading(int(round(cap)) % 360)
+    reset_collision_state()
+    droid.set_speed(VITESSE)
+    while nav["actif"] and not detect_collision():
+        add_trace(*position())
+        yield PERIODE_MS
+    droid.set_speed(0)
+    x, y = position()
+    if det["hit"]:
+        enregistrer_mur(x, y)
+    add_trace(x, y)
+
+
+def sequence_exploration():
+    while nav["actif"]:
+        for base in range(0, 360, 90):
+            status.set(f">> SCAN  |  AXE {base:03d}Â°  |  CONTACTS {n_contacts():03d}  TRACE {len(points):04d}")
+
+            yield from ligne(base)
+            if not nav["actif"]:
+                return
+            yield from ligne((base + 180) % 360)
+            if not nav["actif"]:
+                return
+
+            nav["cap"] = (base - 90) % 360
+            reset_collision_state()
+            droid.roll((base - 90) % 360, ROLL_VITESSE, ROLL_DUREE)
+            touche = False
+            for _ in range(4):
+                if not nav["actif"]:
+                    droid.set_speed(0)
+                    return
+                x, y = position()
+                add_trace(x, y)
+                if detect_collision():
+                    enregistrer_mur(x, y)
+                    touche = True
+                    break
+                yield PERIODE_ROLL_MS
+            droid.set_speed(0)
+            if touche:
+                reset_collision_state()
+                continue
+
+            yield from ligne(base)
+            if not nav["actif"]:
+                return
+            yield from ligne((base + 180) % 360)
+            if not nav["actif"]:
+                return
+
+
+def run_movement_loop(generator):
+    if not nav["actif"]:
+        return
+    try:
+        delay = next(generator)
+        window.after(delay, lambda: run_movement_loop(generator))
+    except StopIteration:
+        nav["actif"] = False
+
+
+def radar_tick():
+    if not nav["actif"]:
+        canvas.delete("sweep")
+        return
+    nav["sweep"] = (nav["sweep"] + 8) % 360
+    draw_sweep(nav["sweep"])
+    window.after(120, radar_tick)
+
+
+def n_contacts():
+    return sum(1 for _, _, col in points if col)
+
+
+def reset_bbox():
+    bbox.update(minx=None, maxx=None, miny=None, maxy=None, span=START_VIEW_CM)
+
+
+def reset_carte(aide=True):
+    points.clear()
+    free_cells.clear()
+    derniere_trace[0] = None
+    derniere_occ[0] = None
+    det.update(hit=False, glissements=0, blocages=0)
+    reset_bbox()
+    fit_to_bbox()
+    decor(tracker=True, aide=aide)
+
+
+def start():
+    if nav["actif"]:
+        return
+    reset_carte(aide=False)
+    nav.update(actif=True, cap=0.0, sweep=0)
+    try:
+        droid.set_stabilization(True)
+    except Exception:
+        pass
+    reset_collision_state()
+    status.set(">> SCAN EN COURS")
+    run_movement_loop(sequence_exploration())
+    radar_tick()
+
+
+def stop():
+    nav["actif"] = False
+    try:
+        droid.set_speed(0)
+        droid.stop_roll()
+    except Exception:
+        pass
+    canvas.delete("sweep")
+    status.set(">> SCAN INTERROMPU")
+
+
+def plan():
+    stop()
+    if len(points) < 3:
+        status.set(">> DONNEES INSUFFISANTES")
+        return
+
+    reset_bbox()
+    for x, y, _col in points:
+        maj_bbox(x, y)
+    for c in free_cells:
+        maj_bbox(*cell_center(c))
+    fit_to_bbox()
+
+    decor(tracker=False)
+    draw_free_cells()
+    for x, y, col in points:
+        draw_point(x, y, col)
+
+    cols = [(x, y) for x, y, col in points if col]
+
+    contour = enveloppe_convexe([cell_center(c) for c in free_cells] + cols)
+    aire_piece = 0.0
+    if len(contour) >= 3:
+        aire_piece = aire_m2(contour)
+        coords = []
+        for p in contour + [contour[0]]:
+            sx, sy = to_screen(*p)
+            coords += [sx, sy]
+        canvas.create_line(*coords, fill=BRIGHT, width=3)
+
+    interieurs = [(x, y) for (x, y) in cols
+                  if len(contour) >= 3 and dist_au_contour((x, y), contour) > D_INTERIEUR_OBSTACLE]
+
+    aire_obstacles, n_obs = 0.0, 0
+    for amas in regrouper(interieurs, R_CLUSTER):
+        if len(amas) < MIN_CLUSTER:
+            continue
+        o = enveloppe_convexe(amas)
+        if len(o) < 3:
+            continue
+        n_obs += 1
+        aire_obstacles += aire_m2(o)
+        coords = []
+        for p in o + [o[0]]:
+            sx, sy = to_screen(*p)
+            coords += [sx, sy]
+        canvas.create_polygon(*coords, fill="", outline=OBST, width=2)
+        ox, oy = moyenne_pts(o)
+        tx, ty = to_screen(ox, oy)
+        canvas.create_text(tx, ty, text="OBST", fill=OBST, font=SMALL)
+
+    aire = max(aire_piece - aire_obstacles, 0.0)
+    canvas.create_text(W / 2, H - 40, text=f"SURFACE  {aire:.2f} mÂ²", fill=HOT, font=BIGF)
+    status.set(f">> PLAN ETABLI  |  SURFACE {aire:.2f} mÂ²  |  OBSTACLES: {n_obs}")
+
+
+def purge():
+    stop()
+    reset_carte(aide=True)
+    afficher_67()
+    status.set(">> SYSTEME PRET")
+
+
+def quitter():
+    nav["actif"] = False
+    try:
+        droid.set_speed(0)
+        droid.stop_roll()
+    except Exception:
+        pass
+    window.destroy()
+
+
+window = tk.Tk()
+window.title("MU-TH-UR 6000 // MOTION TRACKER")
+window.configure(bg=BG)
+window.protocol("WM_DELETE_WINDOW", quitter)
+
+canvas = tk.Canvas(window, bg=BG, width=W, height=H, highlightthickness=0)
+canvas.pack(padx=10, pady=10)
+
+barre = tk.Frame(window, bg=BG)
+barre.pack(fill="x", padx=10)
+
+
+def make_btn(txt, cmd):
+    return tk.Button(barre, text=txt, command=cmd, font=MONO,
+                     bg="#031603", fg=BRIGHT, activebackground=DIM,
+                     activeforeground=HOT, relief="flat", bd=0,
+                     highlightbackground=DIM, highlightthickness=1,
+                     width=11, padx=6, pady=4, cursor="dot")
+
+
+make_btn("> SCAN", start).pack(side="left", padx=4)
+make_btn("# HALT", stop).pack(side="left", padx=4)
+make_btn("+ MAP", plan).pack(side="left", padx=4)
+make_btn("o PURGE", purge).pack(side="left", padx=4)
+make_btn("x EXIT", quitter).pack(side="left", padx=4)
+
+status = tk.StringVar(value=">> SYSTEME PRET  //  1) SCAN   2) MAP")
+tk.Label(window, textvariable=status, font=MONO, bg=BG, fg=MID,
+         anchor="w").pack(fill="x", padx=14, pady=(6, 12))
+
+decor(tracker=True, aide=True)
+window.mainloop()
+
+droid.__exit__(None, None, None)
